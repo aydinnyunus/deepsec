@@ -1,6 +1,5 @@
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
 import { dataDir } from "@deepsec/core";
 import type { Sandbox } from "@vercel/sandbox";
 import { DATA_DIR } from "./setup.js";
@@ -147,11 +146,9 @@ async function extractTarballLocally(tarPath: string, destDir: string): Promise<
   return extracted;
 }
 
-// node-tar isn't a direct dep of this package — it's pulled in transitively
-// and lives under node_modules/.pnpm/tar@<ver>/node_modules/tar. pnpm's
-// strict module isolation hides it from a normal `import "tar"`, so resolve
-// the install location at runtime by walking up looking for the .pnpm dir.
-// Cached after first call.
+// node-tar is a declared dependency; keep it external in the bundle so
+// `import("tar")` resolves from the installed package at runtime (pnpm, npm,
+// or global installs; no reliance on node_modules/.pnpm layout).
 let cachedTar: TarModule | undefined;
 
 interface TarExtractOptions {
@@ -167,30 +164,7 @@ interface TarModule {
 
 async function loadTar(): Promise<TarModule> {
   if (cachedTar) return cachedTar;
-  const tarDir = findTarPackageDir();
-  const entry = path.join(tarDir, "dist", "esm", "index.min.js");
-  const mod = (await import(pathToFileURL(entry).href)) as TarModule;
+  const mod = (await import("tar")) as TarModule;
   cachedTar = mod;
   return mod;
-}
-
-function findTarPackageDir(): string {
-  const start = path.dirname(fileURLToPath(import.meta.url));
-  let dir = start;
-  while (true) {
-    const pnpmDir = path.join(dir, "node_modules", ".pnpm");
-    if (fs.existsSync(pnpmDir)) {
-      const entries = fs.readdirSync(pnpmDir);
-      const tarEntry = entries.find((e) => /^tar@\d/.test(e));
-      if (tarEntry) {
-        return path.join(pnpmDir, tarEntry, "node_modules", "tar");
-      }
-    }
-    const parent = path.dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  throw new Error(
-    "could not locate node-tar in node_modules/.pnpm — run `pnpm install` from the workspace root",
-  );
 }
