@@ -1,6 +1,6 @@
-import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { dataDir } from "@deepsec/core";
 import type { Sandbox } from "@vercel/sandbox";
 import { DATA_DIR } from "./setup.js";
@@ -115,32 +115,82 @@ export async function downloadResults(
   return count;
 }
 
+// The tarball is produced inside the Vercel Sandbox VM, which the README
+// threat model explicitly treats as untrusted (prompt-injected agents can
+// run shell commands there). A previous `tar -xzvf` shell-out followed
+// pre-existing symlinks during extraction, turning sandbox-side code
+// execution into orchestrator-host arbitrary file write
+// (CVE-2007-4131 / CVE-2018-20482 class). Switch to node-tar, which:
+//   - strips absolute paths and `..` components by default
+//   - refuses to extract symlinks pointing outside cwd
+//   - opens regular files with O_NOFOLLOW under the hood
+// The explicit `filter` below additionally rejects symlink AND hardlink
+// members entirely — the agent only ever writes regular FileRecord JSON,
+// so anything else in the archive is by definition adversarial.
 async function extractTarballLocally(tarPath: string, destDir: string): Promise<number> {
-  // Use `tar -xzvf` and count emitted lines for "files extracted" feedback.
-  return await new Promise<number>((resolve, reject) => {
-    const child = spawn("tar", ["-xzvf", tarPath, "-C", destDir], {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let extracted = 0;
-    let stderr = "";
-    let stdoutBuf = "";
-    child.stdout.on("data", (c: Buffer) => {
-      stdoutBuf += c.toString();
-      let nl: number;
-      while ((nl = stdoutBuf.indexOf("\n")) !== -1) {
-        const line = stdoutBuf.slice(0, nl);
-        stdoutBuf = stdoutBuf.slice(nl + 1);
-        if (line && !line.endsWith("/")) extracted++;
+  const tar = await loadTar();
+  let extracted = 0;
+  await tar.extract({
+    file: tarPath,
+    cwd: destDir,
+    filter: (_p, entry) => {
+      const t = (entry as { type?: string }).type;
+      if (t === "SymbolicLink" || t === "Link") {
+        throw new Error(`refusing to extract: tarball contains ${t} member`);
       }
-    });
-    child.stderr.on("data", (c: Buffer) => (stderr += c.toString()));
-    child.on("error", reject);
-    child.on("close", (code) => {
-      if (code !== 0) {
-        reject(new Error(`tar -xzf exited ${code}: ${stderr.slice(0, 500)}`));
-      } else {
-        resolve(extracted);
-      }
-    });
+      return true;
+    },
+    onentry: (entry: { type?: string }) => {
+      if (entry.type === "File") extracted++;
+    },
   });
+  return extracted;
+}
+
+// node-tar isn't a direct dep of this package — it's pulled in transitively
+// and lives under node_modules/.pnpm/tar@<ver>/node_modules/tar. pnpm's
+// strict module isolation hides it from a normal `import "tar"`, so resolve
+// the install location at runtime by walking up looking for the .pnpm dir.
+// Cached after first call.
+let cachedTar: TarModule | undefined;
+
+interface TarExtractOptions {
+  file: string;
+  cwd: string;
+  filter?: (path: string, entry: unknown) => boolean;
+  onentry?: (entry: { type?: string }) => void;
+}
+
+interface TarModule {
+  extract: (opts: TarExtractOptions) => Promise<void>;
+}
+
+async function loadTar(): Promise<TarModule> {
+  if (cachedTar) return cachedTar;
+  const tarDir = findTarPackageDir();
+  const entry = path.join(tarDir, "dist", "esm", "index.min.js");
+  const mod = (await import(pathToFileURL(entry).href)) as TarModule;
+  cachedTar = mod;
+  return mod;
+}
+
+function findTarPackageDir(): string {
+  const start = path.dirname(fileURLToPath(import.meta.url));
+  let dir = start;
+  while (true) {
+    const pnpmDir = path.join(dir, "node_modules", ".pnpm");
+    if (fs.existsSync(pnpmDir)) {
+      const entries = fs.readdirSync(pnpmDir);
+      const tarEntry = entries.find((e) => /^tar@\d/.test(e));
+      if (tarEntry) {
+        return path.join(pnpmDir, tarEntry, "node_modules", "tar");
+      }
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  throw new Error(
+    "could not locate node-tar in node_modules/.pnpm — run `pnpm install` from the workspace root",
+  );
 }
